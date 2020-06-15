@@ -24,15 +24,31 @@
 
 static int page_size;
 
-	static void *
-fault_handler_thread(void *arg)
+/*
+ * Coordinator thread will make this non-zero when it's ready to
+ * release the runner threads
+ */
+static int barrier = 0;
+static char *addr;         /* Start of region handled by userfaultfd */
+
+static void *runner_thread(void *arg) {
+	unsigned long n = (unsigned long) arg; // yuck.
+	while(!barrier) {}
+	printf("Thread %lu touching\n", n); 
+	addr[n * page_size] = barrier;
+	printf("Thread %lu done\n", n);
+	return NULL;
+}
+
+static void *fault_handler_thread(void *arg)
 {
-	static struct uffd_msg msg;   /* Data read from userfaultfd */
+	static struct uffd_msg msgs[5];   /* Data read from userfaultfd */
+	static struct uffd_msg *msg = &(msgs[0]);   /* Data read from userfaultfd */
 	static int fault_cnt = 0;     /* Number of faults so far handled */
 	long uffd;                    /* userfaultfd file descriptor */
 	static char *page = NULL;
 	struct uffdio_copy uffdio_copy;
-	ssize_t nread;
+	ssize_t nread, n_messages, message_idx = 0;
 
 	uffd = (long) arg;
 
@@ -44,6 +60,9 @@ fault_handler_thread(void *arg)
 		if (page == MAP_FAILED)
 			errExit("mmap");
 	}
+
+	printf("sizeof msgs[0] %lu\n", sizeof(msgs[0]));
+	printf("sizeof msgs %lu\n", sizeof(msgs));
 
 	/* Loop, handling incoming events on the userfaultfd
 	   file descriptor */
@@ -57,6 +76,7 @@ fault_handler_thread(void *arg)
 		pollfd.fd = uffd;
 		pollfd.events = POLLIN;
 		nready = poll(&pollfd, 1, -1);
+		sleep(1);
 		if (nready == -1)
 			errExit("poll");
 
@@ -68,7 +88,9 @@ fault_handler_thread(void *arg)
 
 		/* Read an event from the userfaultfd */
 
-		nread = read(uffd, &msg, sizeof(msg));
+		nread = read(uffd, &msgs, sizeof(msgs));
+		printf("nread: %lu\n", nread);
+
 		if (nread == 0) {
 			printf("EOF on userfaultfd!\n");
 			exit(EXIT_FAILURE);
@@ -77,41 +99,52 @@ fault_handler_thread(void *arg)
 		if (nread == -1)
 			errExit("read");
 
-		/* We expect only one kind of event; verify that assumption */
-
-		if (msg.event != UFFD_EVENT_PAGEFAULT) {
-			fprintf(stderr, "Unexpected event on userfaultfd\n");
+		if (nread % sizeof(*msg) != 0) {
+			printf("Didn't read multiple of message size\n");
 			exit(EXIT_FAILURE);
 		}
+		n_messages = nread / sizeof(*msg);
 
-		/* Display info about the page-fault event */
+		for(message_idx = 0; message_idx < n_messages; ++message_idx) {
+			msg = &msgs[message_idx];
+			printf("Processing message: %lu\n", message_idx);
 
-		printf("    UFFD_EVENT_PAGEFAULT event: ");
-		printf("flags = %llx; ", msg.arg.pagefault.flags);
-		printf("address = %llx\n", msg.arg.pagefault.address);
+			/* We expect only one kind of event; verify that assumption */
 
-		/* Copy the page pointed to by 'page' into the faulting
-		   region. Vary the contents that are copied in, so that it
-		   is more obvious that each fault is handled separately. */
+			if (msg->event != UFFD_EVENT_PAGEFAULT) {
+				fprintf(stderr, "Unexpected event on userfaultfd\n");
+				exit(EXIT_FAILURE);
+			}
 
-		memset(page, 'A' + fault_cnt % 20, page_size);
-		fault_cnt++;
+			/* Display info about the page-fault event */
 
-		uffdio_copy.src = (unsigned long) page;
+			printf("    UFFD_EVENT_PAGEFAULT event: ");
+			printf("flags = %llx; ", msg->arg.pagefault.flags);
+			printf("address = %llx\n", msg->arg.pagefault.address);
 
-		/* We need to handle page faults in units of pages(!).
-		   So, round faulting address down to page boundary */
+			/* Copy the page pointed to by 'page' into the faulting
+			   region. Vary the contents that are copied in, so that it
+			   is more obvious that each fault is handled separately. */
 
-		uffdio_copy.dst = (unsigned long) msg.arg.pagefault.address &
-			~(page_size - 1);
-		uffdio_copy.len = page_size;
-		uffdio_copy.mode = 0;
-		uffdio_copy.copy = 0;
-		if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
-			errExit("ioctl-UFFDIO_COPY");
+			memset(page, 'A' + fault_cnt % 20, page_size);
+			fault_cnt++;
 
-		printf("        (uffdio_copy.copy returned %lld)\n",
-				uffdio_copy.copy);
+			uffdio_copy.src = (unsigned long) page;
+
+			/* We need to handle page faults in units of pages(!).
+			   So, round faulting address down to page boundary */
+
+			uffdio_copy.dst = (unsigned long) msg->arg.pagefault.address &
+				~(page_size - 1);
+			uffdio_copy.len = page_size;
+			uffdio_copy.mode = 0;
+			uffdio_copy.copy = 0;
+			if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
+				errExit("ioctl-UFFDIO_COPY");
+
+			printf("        (uffdio_copy.copy returned %lld)\n",
+					uffdio_copy.copy);
+		}
 	}
 }
 
@@ -119,9 +152,11 @@ fault_handler_thread(void *arg)
 main(int argc, char *argv[])
 {
 	long uffd;          /* userfaultfd file descriptor */
-	char *addr;         /* Start of region handled by userfaultfd */
 	unsigned long len;  /* Length of region handled by userfaultfd */
 	pthread_t thr;      /* ID of thread that handles page faults */
+	pthread_t runner_0;
+	pthread_t runner_1;
+	pthread_t runner_2;
 	struct uffdio_api uffdio_api;
 	struct uffdio_register uffdio_register;
 	int s;
@@ -169,26 +204,22 @@ main(int argc, char *argv[])
 	/* Create a thread that will process the userfaultfd events */
 
 	s = pthread_create(&thr, NULL, fault_handler_thread, (void *) uffd);
+	s += pthread_create(&runner_0, NULL, runner_thread, (void *) 0);
+	s += pthread_create(&runner_1, NULL, runner_thread, (void *) 1);
+	s += pthread_create(&runner_2, NULL, runner_thread, (void *) 2);
 	if (s != 0) {
 		errno = s;
 		errExit("pthread_create");
 	}
+	sleep(1);
+	barrier = 0x42;
 
-	/* Main thread now touches memory in the mapping, touching
-	   locations 1024 bytes apart. This will trigger userfaultfd
-	   events for all pages in the region. */
-
-	int l;
-	l = 0xf;    /* Ensure that faulting address is not on a page
-		       boundary, in order to test that we correctly
-		       handle that case in fault_handling_thread() */
-	while (l < len) {
-		char c = addr[l];
-		printf("Read address %p in main(): ", addr + l);
-		printf("%c\n", c);
-		l += 1024;
-		usleep(100000);         /* Slow things down a little */
-	}
+	pthread_join(runner_0, NULL);
+	printf("runner_0 joined\n");
+	pthread_join(runner_1, NULL);
+	printf("runner_1 joined\n");
+	pthread_join(runner_2, NULL);
+	printf("runner_2 joined\n");
 
 	exit(EXIT_SUCCESS);
 }
