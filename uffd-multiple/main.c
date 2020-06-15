@@ -55,7 +55,7 @@ static void *fault_handler_thread(void *arg)
 	/* Create a page that will be copied into the faulting region */
 
 	if (page == NULL) {
-		page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+		page = mmap(NULL, page_size * 3, PROT_READ | PROT_WRITE,
 				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if (page == MAP_FAILED)
 			errExit("mmap");
@@ -109,6 +109,9 @@ static void *fault_handler_thread(void *arg)
 			msg = &msgs[message_idx];
 			printf("Processing message: %lu\n", message_idx);
 
+			if (message_idx != 0)
+				continue;
+
 			/* We expect only one kind of event; verify that assumption */
 
 			if (msg->event != UFFD_EVENT_PAGEFAULT) {
@@ -126,7 +129,7 @@ static void *fault_handler_thread(void *arg)
 			   region. Vary the contents that are copied in, so that it
 			   is more obvious that each fault is handled separately. */
 
-			memset(page, 'A' + fault_cnt % 20, page_size);
+			memset(page, 'A' + fault_cnt % 20, page_size * 3);
 			fault_cnt++;
 
 			uffdio_copy.src = (unsigned long) page;
@@ -134,9 +137,8 @@ static void *fault_handler_thread(void *arg)
 			/* We need to handle page faults in units of pages(!).
 			   So, round faulting address down to page boundary */
 
-			uffdio_copy.dst = (unsigned long) msg->arg.pagefault.address &
-				~(page_size - 1);
-			uffdio_copy.len = page_size;
+			uffdio_copy.dst = (unsigned long) addr;
+			uffdio_copy.len = page_size * 3;
 			uffdio_copy.mode = 0;
 			uffdio_copy.copy = 0;
 			if (ioctl(uffd, UFFDIO_COPY, &uffdio_copy) == -1)
