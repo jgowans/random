@@ -19,71 +19,81 @@
 
 #define INDEXES (MEASUREMENTS_PER_ITER * MEASUREMENT_ACCESSES)
 #define PAGE_SIZE 4096
+
 #define ITERATIONS 100
+#define RUN_TIME_CLOCK (1UL * 60)
 
 #define RANDOM_ACCESS 0
+#define TIMED_RUN 1
 
 int main () {
-	clock_t userspace;
-	struct timespec wall;
-	// [wall_sec, wall_ns, userspace_someting]
-	unsigned long measurements[3 * MEASUREMENTS_PER_ITER];
-	int measurement_idx = 0;
+        clock_t userspace;
+        struct timespec wall;
+        // [wall_sec, wall_ns, userspace_someting]
+        unsigned long measurements[3 * MEASUREMENTS_PER_ITER];
+        int measurement_idx = 0;
+        struct timespec global_start, global_end;
+        clock_gettime(CLOCK_REALTIME, &global_start);
 
-	char *buf = malloc(BUF_SIZE);
-	unsigned int *idx_arr = malloc(INDEXES * sizeof(*idx_arr));
-	if (!buf || !idx_arr)
-		return -ENOMEM;
+        char *buf = malloc(BUF_SIZE);
+        unsigned int *idx_arr = malloc(INDEXES * sizeof(*idx_arr));
+        if (!buf || !idx_arr)
+                return -ENOMEM;
 
-	for(int i = 0; i < INDEXES; ++i)
+        for(int i = 0; i < INDEXES; ++i)
 #if RANDOM_ACCESS
-		idx_arr[i] = rand() % BUF_SIZE;
+                idx_arr[i] = rand() % BUF_SIZE;
 #else
-		idx_arr[i] = i * CACHE_LINE; // technically should mod BUF_SIZE....
+                idx_arr[i] = i * CACHE_LINE; // technically should mod BUF_SIZE....
 #endif
 
-	// pre-fault
-	for(int i = 0; i < BUF_SIZE; i += PAGE_SIZE)
-		buf[i] = 0;
+        // pre-fault
+        for(int i = 0; i < BUF_SIZE; i += PAGE_SIZE)
+                buf[i] = 0;
 
-	clock_gettime(CLOCK_REALTIME, &wall);
-	char file_name[64];
-	sprintf(file_name, "%li", wall.tv_sec);
-	int measure_log_fd = open(file_name, O_WRONLY | O_CREAT, 0664);
-	if (measure_log_fd < 0) {
-		printf("open errno: %i\n", errno);
-		return -errno;
-	}
+        clock_gettime(CLOCK_REALTIME, &wall);
+        char file_name[64];
+        sprintf(file_name, "%li", wall.tv_sec);
+        int measure_log_fd = open(file_name, O_WRONLY | O_CREAT, 0664);
+        if (measure_log_fd < 0) {
+                printf("open errno: %i\n", errno);
+                return -errno;
+        }
+#if TIMED_RUN
+        while(clock_gettime(CLOCK_REALTIME, &global_end)
+                || global_end.tv_sec < global_start.tv_sec + RUN_TIME_CLOCK) {
+#else
+        for(int iteration = 0; iteration < ITERATIONS; ++iteration) {
+                printf("iter: %i\n", iteration);
+#endif
+                //clock_t iteration_userspace = clock();
+                int i = 0;
+                while(i < (MEASUREMENTS_PER_ITER * MEASUREMENT_ACCESSES)) {
+                        for(int j = i; j < i + MEASUREMENT_ACCESSES; ++j) {
+                                buf[idx_arr[j]] += 1;
+                        }
+                        i += MEASUREMENT_ACCESSES;
 
-	for(int iteration = 0; iteration < ITERATIONS; ++iteration) {
-		clock_t iteration_userspace = clock();
-		int i = 0;
-		while(i < (MEASUREMENTS_PER_ITER * MEASUREMENT_ACCESSES)) {
-			for(int j = i; j < i + MEASUREMENT_ACCESSES; ++j) {
-				buf[idx_arr[j]] += 1;
-			}
-			i += MEASUREMENT_ACCESSES;
+                        userspace = clock();
+                        clock_gettime(CLOCK_REALTIME, &wall);
 
-			userspace = clock();
-			clock_gettime(CLOCK_REALTIME, &wall);
-
-			measurements[measurement_idx++] = wall.tv_sec;
-			measurements[measurement_idx++] = wall.tv_nsec;
-			measurements[measurement_idx++] = userspace;
+                        measurements[measurement_idx++] = wall.tv_sec;
+                        measurements[measurement_idx++] = wall.tv_nsec;
+                        measurements[measurement_idx++] = userspace;
 #if 0
-			printf("wall time %lu s\n", measurements[measurement_idx - 3]);
-			printf("clock() time: %lu s\n", measurements[measurement_idx - 1]);
+                        printf("wall time %lu s\n", measurements[measurement_idx - 3]);
+                        printf("clock() time: %lu s\n", measurements[measurement_idx - 1]);
 #endif
 
-		}
-		measurement_idx = 0;
-		printf("iter clock() time: %lu s\n", clock() - iteration_userspace);
-		int rc = write(measure_log_fd, measurements, sizeof(measurements));
-		if (rc == -1) {
-			printf("write failed with %i\n", errno);
-			return -errno;
-		}
-		printf("iter: %i\n", iteration);
-	}
-   	return 0;
+                }
+                measurement_idx = 0;
+                //printf("iter clock() time: %lu s\n", clock() - iteration_userspace);
+                int rc = write(measure_log_fd, measurements, sizeof(measurements));
+                if (rc == -1) {
+                        printf("write failed with %i\n", errno);
+                        return -errno;
+                }
+        }
+        return 0;
 }
+
